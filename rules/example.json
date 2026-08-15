@@ -1,0 +1,43 @@
+{
+  "revision": 1,
+  "rules": [
+    {
+      "rule_id": "main-three-way",
+      "name": "Internal/Processor/Bank three-way reconciliation",
+      "allowed_roles": ["internal", "processor", "bank"],
+      "business_id_fields": {
+        "internal": "business_id",
+        "processor": "business_id",
+        "bank": "business_id"
+      },
+      "business_id_priority": ["business_id"],
+      "amount_tolerance": {"abs": 5, "pct_bps": 0},
+      "fee_tolerance": {"abs": 0, "pct_bps": 0},
+      "time_window_seconds": 120,
+      "dup_policy": {
+        "exact_key": "exclude",
+        "retransmit": "report",
+        "content_fingerprint": "report"
+      },
+      "search_limit": 10000
+    },
+    {
+      "rule_id": "bank-processor-onetomany",
+      "name": "Bank settlement to processor flows",
+      "allowed_roles": ["bank", "processor"],
+      "business_id_fields": {
+        "bank": "business_id",
+        "processor": "business_id"
+      },
+      "amount_tolerance": {"abs": 1, "pct_bps": 0},
+      "fee_tolerance": {"abs": 0, "pct_bps": 0},
+      "time_window_seconds": 600,
+      "one_to_many": {
+        "anchor_role": "bank",
+        "many_role": "processor",
+        "max_members": 5
+      },
+      "search_limit": 100000
+    }
+  ]
+}

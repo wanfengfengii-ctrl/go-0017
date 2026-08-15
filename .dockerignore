@@ -1,0 +1,17 @@
+# Build artifacts and local output we never want in the image context.
+dist/
+*.tar
+*.zip
+*.exe
+*.test
+*.out
+settlemesh
+/settlemesh
+
+# Local environment / editor state.
+.env
+.env.*
+.DS_Store
+.idea/
+.vscode/
+*.swp
