@@ -198,3 +198,166 @@ func TestServiceRecover(t *testing.T) {
 		t.Errorf("run status = %s, want failed", r.Status)
 	}
 }
+
+// TestServiceIsolateRecordsReported is a regression test for invalid records
+// imported under RowPolicyIsolate: each isolated row must surface as an
+// invalid_record discrepancy in the reconciliation result and in the exported
+// report (JSON and CSV), and the aggregated summary must count them. The
+// result must be identical for any reconcile worker count.
+func TestServiceIsolateRecordsReported(t *testing.T) {
+	svc := testService(t)
+	// Each source contributes one valid row (shared business id B1 -> one
+	// exact-id match group) and one invalid row that becomes an isolated
+	// record under the isolate policy.
+	internal := "external_id,amount,timestamp,direction,business_id\n" +
+		"I1,100.00,2026-01-02T03:04:05Z,credit,B1\n" +
+		"I2,,2026-01-02T03:04:05Z,credit,B2\n" // missing amount
+	processor := "external_id,amount,timestamp,direction,business_id\n" +
+		"P1,100.00,2026-01-02T03:04:05Z,credit,B1\n" +
+		"P2,100.00,not-a-timestamp,credit,B2\n" // bad timestamp
+	bank := "external_id,amount,timestamp,direction,business_id\n" +
+		"K1,100.00,2026-01-02T03:04:05Z,credit,B1\n" +
+		",100.00,2026-01-02T03:04:05Z,credit,B2\n" // missing external id
+
+	bi, err := svc.SubmitAndCommit("internal", "ki", "csv", strings.NewReader(internal), model.RowPolicyIsolate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bp, err := svc.SubmitAndCommit("processor", "kp", "csv", strings.NewReader(processor), model.RowPolicyIsolate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bk, err := svc.SubmitAndCommit("bank", "kb", "csv", strings.NewReader(bank), model.RowPolicyIsolate)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Batch submission: each committed batch accounts for one valid and one
+	// isolated record.
+	for _, b := range []*model.Batch{bi, bp, bk} {
+		if b.Status != model.BatchCommitted {
+			t.Fatalf("batch %s status = %s, want committed", b.ID, b.Status)
+		}
+		if b.Summary == nil {
+			t.Fatalf("batch %s missing summary", b.ID)
+		}
+		if b.Summary.ValidCount != 1 {
+			t.Errorf("batch %s valid_count = %d, want 1", b.ID, b.Summary.ValidCount)
+		}
+		if b.Summary.InvalidCount != 1 {
+			t.Errorf("batch %s invalid_count = %d, want 1", b.ID, b.Summary.InvalidCount)
+		}
+	}
+
+	batchIDs := []string{bi.ID, bp.ID, bk.ID}
+
+	// Reconciliation run with a single worker as the baseline.
+	baseline, err := svc.StartRun("run_iso_1", batchIDs, 1, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if baseline.Status != model.RunSucceeded {
+		t.Fatalf("baseline status = %s, want succeeded", baseline.Status)
+	}
+	// Valid rows form one exact-id match group of three members.
+	if len(baseline.MatchGroups) != 1 {
+		t.Fatalf("baseline groups = %d, want 1", len(baseline.MatchGroups))
+	}
+	if len(baseline.MatchGroups[0].RecordIDs) != 3 {
+		t.Errorf("baseline match members = %d, want 3", len(baseline.MatchGroups[0].RecordIDs))
+	}
+	// Each isolated record surfaces as an invalid_record discrepancy.
+	if got := countByType(baseline.Discrepancies, model.DiscInvalidRecord); got != 3 {
+		t.Fatalf("baseline invalid_record discrepancies = %d, want 3", got)
+	}
+	// Report aggregation: the summary counts the invalid records.
+	if baseline.Summary == nil {
+		t.Fatal("baseline summary is nil")
+	}
+	if got := baseline.Summary.DiscrepancyCounts[model.DiscInvalidRecord]; got != 3 {
+		t.Errorf("summary invalid_record count = %d, want 3", got)
+	}
+
+	// Exported reports surface the invalid records in both formats.
+	jsonData, err := svc.ExportReport("run_iso_1", "json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(jsonData), "invalid_record") {
+		t.Errorf("json report missing invalid_record: %s", jsonData)
+	}
+	csvData, err := svc.ExportReport("run_iso_1", "csv")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(csvData), "invalid_record") {
+		t.Errorf("csv report missing invalid_record: %s", csvData)
+	}
+
+	// Consistency across worker configurations: identical discrepancy and
+	// match-group id sets for any reconcile worker count.
+	wantDiscs := idSet(discIDs(baseline.Discrepancies))
+	wantGroups := idSet(groupIDs(baseline.MatchGroups))
+	runIDs := map[int]string{2: "run_iso_2", 4: "run_iso_4", 8: "run_iso_8"}
+	for _, w := range []int{2, 4, 8} {
+		run, err := svc.StartRun(runIDs[w], batchIDs, 1, w)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := countByType(run.Discrepancies, model.DiscInvalidRecord); got != 3 {
+			t.Errorf("workers=%d: invalid_record discrepancies = %d, want 3", w, got)
+		}
+		if !equalStringSet(wantDiscs, idSet(discIDs(run.Discrepancies))) {
+			t.Errorf("workers=%d: discrepancy id set differs", w)
+		}
+		if !equalStringSet(wantGroups, idSet(groupIDs(run.MatchGroups))) {
+			t.Errorf("workers=%d: match group id set differs", w)
+		}
+	}
+}
+
+func countByType(ds []*model.Discrepancy, dtype model.DiscType) int {
+	n := 0
+	for _, d := range ds {
+		if d.Type == dtype {
+			n++
+		}
+	}
+	return n
+}
+
+func discIDs(ds []*model.Discrepancy) []string {
+	out := make([]string, 0, len(ds))
+	for _, d := range ds {
+		out = append(out, d.ID)
+	}
+	return out
+}
+
+func groupIDs(gs []*model.MatchGroup) []string {
+	out := make([]string, 0, len(gs))
+	for _, g := range gs {
+		out = append(out, g.ID)
+	}
+	return out
+}
+
+func idSet(ids []string) map[string]bool {
+	m := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		m[id] = true
+	}
+	return m
+}
+
+func equalStringSet(a, b map[string]bool) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k := range a {
+		if !b[k] {
+			return false
+		}
+	}
+	return true
+}

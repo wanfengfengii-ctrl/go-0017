@@ -143,10 +143,17 @@ func (c *Coordinator) Run(snap *Snapshot, workers int) *Result {
 func partitionByCurrency(records []*model.Record, excluded map[string]bool) map[string][]*model.Record {
 	out := make(map[string][]*model.Record)
 	for _, r := range records {
-		if excluded[r.ID] {
+		if r.Isolated {
+			// Invalid records imported under RowPolicyIsolate are routed to the
+			// matching engine so each is reported as an invalid_record
+			// discrepancy. They bypass dedup exclusion: an invalid row must
+			// always surface in the reconciliation result and the exported
+			// report, never be silently dropped. The engine emits the
+			// discrepancy before consulting the excluded set.
+			out[r.Amount.C.Code] = append(out[r.Amount.C.Code], r)
 			continue
 		}
-		if r.Isolated {
+		if excluded[r.ID] {
 			continue
 		}
 		key := r.Amount.C.Code
