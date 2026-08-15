@@ -1,6 +1,10 @@
 package service
 
 import (
+	"bytes"
+	"encoding/csv"
+	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -176,6 +180,103 @@ func TestServiceExportReport(t *testing.T) {
 	}
 	if !strings.Contains(string(csvData), "discrepancy_id") {
 		t.Errorf("csv report missing header: %s", csvData)
+	}
+}
+
+func TestServiceIsolatedInvalidRecordsAppearInReconciliationReportsAcrossWorkers(t *testing.T) {
+	internalCSV := "external_id,amount,timestamp,direction,business_id\nI1,100.00,2026-01-02T03:04:05Z,credit,B1\nI2,not-a-number,2026-01-02T03:04:05Z,credit,B2\n"
+	processorCSV := "external_id,amount,timestamp,direction,business_id\nP1,100.00,2026-01-02T03:04:05Z,credit,B1\n"
+
+	var baselineJSON, baselineCSV []byte
+	for _, workers := range []int{1, 4} {
+		t.Run(fmt.Sprintf("workers_%d", workers), func(t *testing.T) {
+			svc := testService(t)
+			WithWorkers(workers)(svc)
+
+			internalBatch, err := svc.SubmitAndCommit("internal", "internal-key", "csv", strings.NewReader(internalCSV), model.RowPolicyIsolate)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if internalBatch.Status != model.BatchCommitted {
+				t.Fatalf("batch status = %s, want %s", internalBatch.Status, model.BatchCommitted)
+			}
+			if internalBatch.Summary == nil || internalBatch.Summary.ValidCount != 1 || internalBatch.Summary.InvalidCount != 1 {
+				t.Fatalf("batch summary = %+v, want valid=1 invalid=1", internalBatch.Summary)
+			}
+
+			processorBatch, err := svc.SubmitAndCommit("processor", "processor-key", "csv", strings.NewReader(processorCSV), model.RowPolicyIsolate)
+			if err != nil {
+				t.Fatal(err)
+			}
+			run, err := svc.StartRun("isolated-run", []string{internalBatch.ID, processorBatch.ID}, 1, workers)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if run.Status != model.RunSucceeded {
+				t.Fatalf("run status = %s, want %s", run.Status, model.RunSucceeded)
+			}
+			if len(run.MatchGroups) != 1 || len(run.MatchGroups[0].RecordIDs) != 2 {
+				t.Fatalf("match groups = %+v, want one two-record group", run.MatchGroups)
+			}
+			if len(run.Discrepancies) != 1 {
+				t.Fatalf("discrepancies = %d, want 1", len(run.Discrepancies))
+			}
+			disc := run.Discrepancies[0]
+			if disc.Type != model.DiscInvalidRecord || disc.Note == "" {
+				t.Fatalf("discrepancy = %+v, want invalid_record with reason", disc)
+			}
+			if len(disc.Evidence) != 1 || disc.Evidence[0].RecordID != "rec_invalid_internal_2" {
+				t.Fatalf("evidence = %+v, want isolated source record", disc.Evidence)
+			}
+			if run.Summary == nil || run.Summary.DiscrepancyCounts[model.DiscInvalidRecord] != 1 {
+				t.Fatalf("report summary = %+v, want invalid_record=1", run.Summary)
+			}
+
+			jsonData, err := svc.ExportReport(run.ID, "json")
+			if err != nil {
+				t.Fatal(err)
+			}
+			var jsonReport struct {
+				Discrepancies []struct {
+					Type     model.DiscType   `json:"type"`
+					Note     string           `json:"note"`
+					Evidence []model.Evidence `json:"evidence"`
+				} `json:"discrepancies"`
+				Summary *model.ReportSummary `json:"summary"`
+			}
+			if err := json.Unmarshal(jsonData, &jsonReport); err != nil {
+				t.Fatal(err)
+			}
+			if len(jsonReport.Discrepancies) != 1 || jsonReport.Discrepancies[0].Type != model.DiscInvalidRecord || jsonReport.Discrepancies[0].Note != disc.Note || len(jsonReport.Discrepancies[0].Evidence) != 1 {
+				t.Fatalf("JSON discrepancies = %+v, want the isolated record and reason", jsonReport.Discrepancies)
+			}
+			if jsonReport.Summary == nil || jsonReport.Summary.DiscrepancyCounts[model.DiscInvalidRecord] != 1 {
+				t.Fatalf("JSON summary = %+v, want invalid_record=1", jsonReport.Summary)
+			}
+
+			csvData, err := svc.ExportReport(run.ID, "csv")
+			if err != nil {
+				t.Fatal(err)
+			}
+			reader := csv.NewReader(strings.NewReader(string(csvData)))
+			reader.FieldsPerRecord = -1
+			rows, err := reader.ReadAll()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(rows) != 3 || len(rows[1]) != 6 || rows[1][1] != string(model.DiscInvalidRecord) || rows[1][3] != disc.Note || rows[1][4] != disc.Evidence[0].RecordID {
+				t.Fatalf("CSV rows = %v, want one invalid_record row with evidence and reason", rows)
+			}
+
+			if baselineJSON == nil {
+				baselineJSON = append([]byte(nil), jsonData...)
+				baselineCSV = append([]byte(nil), csvData...)
+				return
+			}
+			if !bytes.Equal(jsonData, baselineJSON) || !bytes.Equal(csvData, baselineCSV) {
+				t.Fatal("reports differ across worker configurations")
+			}
+		})
 	}
 }
 

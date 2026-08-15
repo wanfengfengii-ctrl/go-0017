@@ -143,10 +143,12 @@ func (c *Coordinator) Run(snap *Snapshot, workers int) *Result {
 func partitionByCurrency(records []*model.Record, excluded map[string]bool) map[string][]*model.Record {
 	out := make(map[string][]*model.Record)
 	for _, r := range records {
-		if excluded[r.ID] {
+		if r.Isolated {
+			key := r.Amount.C.Code
+			out[key] = append(out[key], r)
 			continue
 		}
-		if r.Isolated {
+		if excluded[r.ID] {
 			continue
 		}
 		key := r.Amount.C.Code
